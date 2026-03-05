@@ -245,9 +245,9 @@
   </style>
   <!-- SheetJS 라이브러리 -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
-  <!-- Firebase SDK (Firestore) -->
+  <!-- Firebase SDK (Realtime Database) -->
   <script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-app-compat.js"></script>
-  <script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-firestore-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-database-compat.js"></script>
   <script>
     var currentParticipant = '';
     var cardCount = 0;
@@ -258,14 +258,13 @@
     /* ===== Firebase 설정 =====
      * ① https://console.firebase.google.com 에서 프로젝트를 만드세요.
      * ② 프로젝트 설정 > 내 앱 > 웹 앱 추가 후 아래 값을 붙여 넣으세요.
-     * ③ Firestore Database를 생성하고 보안 규칙을 아래와 같이 설정하세요:
+     * ③ Realtime Database를 생성하고 보안 규칙을 아래와 같이 설정하세요:
      *
-     *   rules_version = '2';
-     *   service cloud.firestore {
-     *     match /databases/{database}/documents {
-     *       match /preCMS/{document=**} {
-     *         allow read: if true;
-     *         allow write: if true;
+     *   {
+     *     "rules": {
+     *       "preCMS": {
+     *         ".read": true,
+     *         ".write": true
      *       }
      *     }
      *   }
@@ -273,6 +272,7 @@
 const firebaseConfig = {
   apiKey: "AIzaSyA4rm20gLnWNzH6niB-GDRlppQesxTWfiY",
   authDomain: "precmsi-lty2026h.firebaseapp.com",
+  databaseURL: "https://precmsi-lty2026h-default-rtdb.asia-southeast1.firebasedatabase.app",
   projectId: "precmsi-lty2026h",
   storageBucket: "precmsi-lty2026h.firebasestorage.app",
   messagingSenderId: "101301398126",
@@ -284,7 +284,8 @@ const firebaseConfig = {
     var firebaseInitPromise = null; // 초기화 완료를 기다리기 위한 Promise
 
     function isFirebaseConfigured() {
-      return firebaseConfig.apiKey && firebaseConfig.apiKey !== "YOUR_API_KEY";
+      return firebaseConfig.apiKey && firebaseConfig.apiKey !== "YOUR_API_KEY" &&
+             firebaseConfig.databaseURL && firebaseConfig.databaseURL !== "YOUR_DATABASE_URL";
     }
 
     function initFirebase() {
@@ -295,23 +296,21 @@ const firebaseConfig = {
       }
       try {
         if (!firebase.apps.length) firebase.initializeApp(firebaseConfig);
-        db = firebase.firestore();
-        updateFirebaseStatus('checking');
-        // 연결 확인 겸 최초 카드 데이터를 미리 가져옴
-        // → 참여자가 빠르게 로그인해도 이 Promise를 기다려서 카드를 받을 수 있음
-        firebaseInitPromise = db.collection('preCMS').doc('researcherCards').get()
-          .then(function(snap) {
-            firebaseReady = true;
-            updateFirebaseStatus('connected');
-            return snap;           // snapshot을 그대로 반환해 재사용
-          })
+        db = firebase.database();
+        // SDK 초기화 성공 → 즉시 사용 가능 상태로 설정
+        firebaseReady = true;
+        updateFirebaseStatus('connected');
+        // 참여자용 카드 데이터 백그라운드 선(先)로드
+        // (실패해도 firebaseReady/status에 영향 없음)
+        firebaseInitPromise = db.ref('preCMS/researcherCards').once('value')
+          .then(function(snap) { return snap; })
           .catch(function(e) {
-            console.error('Firebase 연결 실패:', e);
-            updateFirebaseStatus('error');
+            console.warn('Firebase 카드 선로드 실패 (보안규칙 또는 네트워크):', e.code || e.message);
             return null;
           });
       } catch(e) {
         console.error('Firebase 초기화 실패:', e);
+        firebaseReady = false;
         updateFirebaseStatus('error');
         firebaseInitPromise = Promise.resolve(null);
       }
@@ -344,17 +343,14 @@ const firebaseConfig = {
     }
 
     async function saveCardsToFirebase() {
-      // Firebase가 아직 초기화 중이면 완료될 때까지 대기
-      if (!firebaseReady) {
-        if (!firebaseInitPromise) {
-          alert('Firebase가 설정되지 않았습니다.\nfirebaseConfig를 먼저 입력하세요.');
-          return;
-        }
+      // db가 없으면 Firebase 자체가 설정되지 않은 것
+      if (!db) {
+        alert('Firebase가 설정되지 않았습니다.\nfirebaseConfig를 먼저 입력하세요.');
+        return;
+      }
+      // 아직 초기화 중이면 완료를 기다림 (타이밍 문제 방지)
+      if (firebaseInitPromise && !firebaseReady) {
         await firebaseInitPromise;
-        if (!firebaseReady) {
-          alert('Firebase에 연결할 수 없습니다.\n브라우저 광고차단 또는 네트워크를 확인하세요.');
-          return;
-        }
       }
       var allCards = {};
       document.querySelectorAll('#cardsContainer .card').forEach(function(card) {
@@ -365,7 +361,7 @@ const firebaseConfig = {
       var btn = document.getElementById('firebaseSaveBtn');
       if (btn) { btn.textContent = '저장 중…'; btn.disabled = true; }
       try {
-        await db.collection('preCMS').doc('researcherCards').set({
+        await db.ref('preCMS/researcherCards').set({
           cardCount: cardCount,
           allCards: allCards,
           timestamp: new Date().toISOString()
@@ -387,25 +383,18 @@ const firebaseConfig = {
     }
 
     async function loadCardsFromFirebase() {
-      if (!firebaseInitPromise) return false;
-      var snap;
-      if (!firebaseReady) {
-        // 아직 초기화 중이면 완료될 때까지 대기 (이미 데이터를 가져오는 중임)
-        snap = await firebaseInitPromise;
-      } else {
-        // 이미 연결된 상태면 최신 데이터로 새로 요청
-        try {
-          snap = await db.collection('preCMS').doc('researcherCards').get();
-        } catch(e) {
-          console.error('Firebase 불러오기 실패:', e);
-          return false;
-        }
+      if (!firebaseReady || !db) return false;
+      try {
+        var snap = await db.ref('preCMS/researcherCards').once('value');
+        if (!snap || !snap.exists()) return false;
+        var data = snap.val();
+        if (!data || !data.allCards || Object.keys(data.allCards).length === 0) return false;
+        applyResearcherCards(data.cardCount || 0, data.allCards);
+        return true;
+      } catch(e) {
+        console.error('Firebase 불러오기 실패:', e);
+        return false;
       }
-      if (!snap || !snap.exists) return false;
-      var data = snap.data();
-      if (!data.allCards || Object.keys(data.allCards).length === 0) return false;
-      applyResearcherCards(data.cardCount || 0, data.allCards);
-      return true;
     }
 
     function applyResearcherCards(count, allCards) {
